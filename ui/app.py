@@ -1,61 +1,11 @@
-import json
-import os
 import threading
 import flet as ft
 from ai_client import AIClient
 from tools import summarize_text
+from .config import load_config, save_config, default_model_for_provider, model_options_for_provider
+from .topbar import make_top_bar
+from .chat.view import ChatView
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ai_assistant_config.json")
-
-
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f)
-    except Exception as e:
-        print("Warning: failed to save config:", e)
-
-
-def default_model_for_provider(provider: str):
-    if provider == "openai":
-        return "gpt-3.5-turbo"
-    if provider == "gemini":
-        return "text-bison-001"
-    return None
-
-
-def model_options_for_provider(provider: str):
-    if provider == "openai":
-        return ["gpt-3.5-turbo", "gpt-4", "gpt-4o"]
-    if provider == "gemini":
-        return ["text-bison-001"]
-    return []
-
-
-def make_message_container(role: str, text: str, idx: int, select_handler):
-    bg = "#E8F0FE" if role == "User" else "#F6F6F6"
-    return ft.Container(
-        content=ft.Column([
-            ft.Text(f"{role}", weight=ft.FontWeight.BOLD, size=12),
-            ft.Text(text, selectable=True)
-        ]),
-        padding=10,
-        margin=ft.margin.only(bottom=8),
-        bgcolor=bg,
-        border=ft.border.all(1, "#E0E0E0"),
-        border_radius=8,
-        on_click=lambda e: select_handler(idx),
-    )
 
 
 def main(page: ft.Page):
@@ -68,11 +18,12 @@ def main(page: ft.Page):
     provider = cfg.get("provider", "openai")
     client = None
 
-    selected_indices = set()
-
-    messages_list = ft.Column(expand=True)
-
     status = ft.Text(f"Welcome to AI Assistant Tools. Provider: {provider}. Set API keys in Settings.")
+
+    # placeholder variables for view switching (chat_view created later)
+    other_view = ft.Container(content=ft.Text("Alternate View"), expand=True, alignment=ft.alignment.center)
+    content_slot = None
+    current_view_is_chat = True
 
     def ensure_client():
         nonlocal client
@@ -102,47 +53,17 @@ def main(page: ft.Page):
             page.update()
             return False
 
-    def append_chat(role, text):
-        idx = len(messages_list.controls)
-        messages_list.controls.append(make_message_container(role, text, idx, toggle_select))
-        page.update()
+    # Chat view will provide message container and selection logic
 
-    def toggle_select(idx: int):
-        # toggle selection state visually
-        if idx in selected_indices:
-            selected_indices.remove(idx)
-            messages_list.controls[idx].border = ft.border.all(1, "#E0E0E0")
-        else:
-            selected_indices.add(idx)
-            messages_list.controls[idx].border = ft.border.all(2, "#1E88E5")
-        page.update()
-
-    input_field = ft.TextField(hint_text="Type a message...", expand=True)
-
-    # model selection dropdown to the left of the input field
-    model_dd = ft.Dropdown(
-        options=[ft.dropdown.Option(o) for o in model_options_for_provider(provider)],
-        value=cfg.get(f"{provider}_model", default_model_for_provider(provider)),
-        width=220,
-    )
-
-    def model_changed(e=None):
-        nonlocal client, cfg, provider
-        sel = model_dd.value or default_model_for_provider(provider)
-        cfg[f"{provider}_model"] = sel
-        save_config(cfg)
-        client = None
-        page.update()
-
-    model_dd.on_change = model_changed
+    # input + model selection row will be created after handlers are defined
 
     def do_send(e=None):
         nonlocal client
-        message = input_field.value.strip()
+        message = chat_view.input_field.value.strip()
         if not message:
             return
-        append_chat("User", message)
-        input_field.value = ""
+        chat_view.append_chat("User", message)
+        chat_view.input_field.value = ""
         page.update()
 
         if not ensure_client():
@@ -152,9 +73,9 @@ def main(page: ft.Page):
             try:
                 messages = [{"role": "user", "content": message}]
                 response = client.chat(messages)
-                append_chat("Assistant", response)
+                chat_view.append_chat("Assistant", response)
             except Exception as e:
-                append_chat("Error", str(e))
+                chat_view.append_chat("Error", str(e))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -195,8 +116,10 @@ def main(page: ft.Page):
             save_config(cfg)
             provider = sel
             # update top-level model dropdown to reflect new provider & model
-            model_dd.options = [ft.dropdown.Option(o) for o in model_options_for_provider(provider)]
-            model_dd.value = cfg.get(f"{provider}_model", default_model_for_provider(provider))
+            # update chat view's model dropdown if present
+            if 'chat_view' in locals():
+                chat_view.model_dd.options = [ft.dropdown.Option(o) for o in model_options_for_provider(provider)]
+                chat_view.model_dd.value = cfg.get(f"{provider}_model", default_model_for_provider(provider))
             client = None
             status.value = f"Provider: {provider}"
             page.dialog.open = False
@@ -230,7 +153,7 @@ def main(page: ft.Page):
     def summarize_selection(e=None):
         nonlocal client
         # collect selected text
-        selected_texts = [messages_list.controls[i].content.controls[1].value for i in sorted(selected_indices)]
+        selected_texts = chat_view.get_selected_texts() if 'chat_view' in locals() else []
         if not selected_texts:
             # prompt to paste or summarize last message
             dlg_field = ft.TextField(hint_text="Paste text to summarize", multiline=True, width=600, height=200)
@@ -271,8 +194,30 @@ def main(page: ft.Page):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    top_bar = ft.Row([ft.ElevatedButton("Set API Key", on_click=set_api_key_dialog), ft.ElevatedButton("Clear API Key", on_click=clear_api_key), ft.ElevatedButton("Summarize Selection", on_click=summarize_selection)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+    # model change handler
+    def model_changed(e=None):
+        nonlocal client, cfg, provider
+        sel = chat_view.model_dd.value or default_model_for_provider(provider)
+        cfg[f"{provider}_model"] = sel
+        save_config(cfg)
+        client = None
+        page.update()
 
-    send_row = ft.Row([model_dd, input_field, ft.ElevatedButton("Send", on_click=do_send)], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+    # now create chat view using the send handler and model change handler
+    chat_view = ChatView(page, cfg, provider, on_send=do_send, on_model_change=model_changed)
 
-    page.add(status, ft.Divider(), top_bar, ft.Container(messages_list, expand=True, padding=10), send_row)
+    # content slot for view switching
+    content_slot = ft.Container(content=chat_view.view, expand=True)
+
+    def toggle_view(e=None):
+        nonlocal current_view_is_chat
+        if current_view_is_chat:
+            content_slot.content = other_view
+        else:
+            content_slot.content = chat_view.view
+        current_view_is_chat = not current_view_is_chat
+        page.update()
+
+    top_bar = make_top_bar(set_api_key_dialog, clear_api_key, summarize_selection, switch_cb=toggle_view)
+
+    page.add(status, ft.Divider(), top_bar, content_slot)
